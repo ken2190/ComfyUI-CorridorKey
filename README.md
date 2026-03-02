@@ -3,9 +3,9 @@
 ## 1) Project name + one line summary
 
 `ComfyUI-CorridorKey` is a ComfyUI custom node package that exposes a native `CorridorKey` inference node for four-pass CorridorKey processing inside ComfyUI.
+
+
 ![Screenshot 2026-03-02 135455](https://github.com/user-attachments/assets/c7383c75-b88b-4d62-978e-3f6be1cf46cf)
-
-
 ## 2) Problem statement and goals (what it does, what it does NOT do)
 
 `ComfyUI-CorridorKey` adapts the upstream `CorridorKey` inference flow for ComfyUI users who already build coarse alpha hints inside ComfyUI. Instead of running the upstream command-line wizard and instead of bundling extra mask-generation tools such as `VideoMaMa` or `GVM`, the main node accepts:
