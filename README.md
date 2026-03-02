@@ -219,7 +219,11 @@ Environment variables for performance and CUDA behavior:
 
 ## 7) Usage (examples, CLI/API examples if relevant)
 
-Recommended ComfyUI flow:
+Recommended ComfyUI workflow:
+![Screenshot 2026-03-02 135304](https://github.com/user-attachments/assets/28665ba9-08ff-4daf-bfc3-80dcaec67ca3)
+
+
+
 
 1. Load or generate an image.
 2. Create a coarse alpha hint using existing ComfyUI nodes such as RMBG, SAM, Segment Anything, Florence-based tools, or manual masking nodes.
