@@ -3,6 +3,8 @@
 ## 1) Project name + one line summary
 
 `ComfyUI-CorridorKey` is a ComfyUI custom node package that exposes a native `CorridorKey` inference node for four-pass CorridorKey processing inside ComfyUI.
+![Screenshot 2026-03-02 135455](https://github.com/user-attachments/assets/c7383c75-b88b-4d62-978e-3f6be1cf46cf)
+
 
 ## 2) Problem statement and goals (what it does, what it does NOT do)
 
