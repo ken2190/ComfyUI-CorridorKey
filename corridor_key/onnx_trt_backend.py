@@ -1,13 +1,20 @@
 """ONNX export and TensorRT/CUDA inference backend for CorridorKey.
 
 Fallback chain: TensorRT EP -> CUDA EP -> None (caller uses PyTorch).
-The ONNX model is exported once and cached. The TRT engine is built by
-ORT on first session creation and cached to disk.
+
+The ONNX model is exported once on the host and placed alongside the .pth
+file (e.g. /home/ubuntu/DATA/ComfyUI/models/corridorkey/). It is then
+mounted read-only into the container just like the .pth, and symlinked
+into the custom node's models/ dir by entrypoint.sh.
+
+The TRT engine cache (GPU-specific, rebuilt per container) goes into the
+custom node's writable models/ dir.
 """
 from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -80,18 +87,23 @@ def _onnx_path_for(models_dir: Path, img_size: int) -> Path:
 
 def export_onnx(
     model: nn.Module,
-    models_dir: Path,
+    output_dir: Path,
     img_size: int,
     max_batch: int = 4,
     device: torch.device | None = None,
 ) -> Path:
-    """Export GreenFormer to ONNX. Returns path to the .onnx file."""
-    onnx_path = _onnx_path_for(models_dir, img_size)
+    """Export GreenFormer to ONNX. Writes to output_dir (must be writable).
+
+    Meant to be run once on the host, then the .onnx file is placed alongside
+    the .pth in the models directory and mounted into the container read-only.
+    """
+    onnx_path = _onnx_path_for(output_dir, img_size)
     if onnx_path.exists():
         LOGGER.info("ONNX model already exists: %s", onnx_path)
         return onnx_path
 
-    LOGGER.info("Exporting GreenFormer to ONNX (size=%d, max_batch=%d)...", img_size, max_batch)
+    LOGGER.info("Exporting GreenFormer to ONNX (size=%d, max_batch=%d, dir=%s)...",
+                img_size, max_batch, output_dir)
     t0 = time.monotonic()
 
     wrapper = _GreenFormerONNXWrapper(model)
@@ -131,6 +143,15 @@ def export_onnx(
     return onnx_path
 
 
+def find_onnx_model(models_dir: Path, img_size: int) -> Path | None:
+    """Look for a pre-exported ONNX model in the models dir (read-only is fine)."""
+    onnx_path = _onnx_path_for(models_dir, img_size)
+    if onnx_path.exists():
+        return onnx_path
+    # Also check via symlink (entrypoint symlinks host files into custom node models/)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # ORT inference session with TensorRT EP
 # ---------------------------------------------------------------------------
@@ -141,6 +162,7 @@ class OnnxTrtSession:
     def __init__(
         self,
         onnx_path: Path,
+        trt_cache_dir: Path,
         device_id: int = 0,
         img_size: int = 2048,
         max_batch: int = 4,
@@ -153,7 +175,8 @@ class OnnxTrtSession:
         self._fp16 = fp16
         self.active_provider: str = "unknown"
 
-        cache_dir = onnx_path.parent / "trt_cache" / f"s{img_size}_b{max_batch}_gpu{device_id}"
+        # TRT engine cache goes to the writable custom node models dir
+        cache_dir = trt_cache_dir / f"trt_cache_s{img_size}_b{max_batch}_gpu{device_id}"
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         shape_str = f"input:{max_batch}x4x{img_size}x{img_size}"
@@ -286,8 +309,9 @@ def get_ort_session(
 ) -> OnnxTrtSession | None:
     """Get or create a cached ORT TensorRT session.
 
-    Exports ONNX model if needed, then creates the ORT session (which triggers
-    TRT engine build on first run). Returns None if anything fails.
+    Looks for a pre-exported ONNX model in models_dir (read-only, alongside .pth).
+    If not found, returns None — run scripts/build_trt_engine.py on the host first.
+    TRT engine cache is written to models_dir (must be writable for trt_cache/).
     """
     cache_key = (str(models_dir), device_id, img_size, max_batch)
     cached = _ORT_SESSION_CACHE.get(cache_key)
@@ -295,18 +319,22 @@ def get_ort_session(
         return cached
 
     try:
-        # Export ONNX if needed (uses CPU to avoid GPU memory pressure)
-        onnx_path = export_onnx(
-            model=model,
-            models_dir=models_dir,
-            img_size=img_size,
-            max_batch=max_batch,
-            device=torch.device("cpu"),
-        )
+        onnx_path = find_onnx_model(models_dir, img_size)
+        if onnx_path is None:
+            LOGGER.warning(
+                "ONNX model not found: %s. "
+                "Run scripts/build_trt_engine.py on the host to export it, "
+                "then place it in the models directory alongside the .pth file.",
+                _onnx_path_for(models_dir, img_size).name,
+            )
+            return None
 
-        # Create ORT session (TRT engine build happens here on first call)
+        LOGGER.info("Found ONNX model: %s", onnx_path)
+
+        # TRT engine cache: writable dir inside the custom node's models/
         session = OnnxTrtSession(
             onnx_path=onnx_path,
+            trt_cache_dir=models_dir,
             device_id=device_id,
             img_size=img_size,
             max_batch=max_batch,
