@@ -48,7 +48,10 @@ def _enable_tf32() -> bool:
 
 
 def _use_torch_compile() -> bool:
-    return _parse_bool_env("CORRIDORKEY_TORCH_COMPILE", True)
+    # Default off: torch.compile with reduce-overhead takes 20-60min to JIT on V100
+    # and provides minimal speedup on Volta GPUs. Set CORRIDORKEY_TORCH_COMPILE=true
+    # to enable on Ampere+ (A100/H100) where it can help.
+    return _parse_bool_env("CORRIDORKEY_TORCH_COMPILE", False)
 
 
 def _configure_torch_for_inference(device_type: str) -> None:
