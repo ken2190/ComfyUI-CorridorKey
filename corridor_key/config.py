@@ -13,7 +13,8 @@ class CorridorKeySettings:
     auto_despeckle: str = "On"
     despeckle_size: int = 400
     inference_size: int = 2048
-    compute_qc: str = "On"
+    compute_qc: str = "Off"
+    compute_processed: str = "Off"
     chunk_size: int = 50
     batch_size: int = 1
     num_gpus: int = 0  # 0 = auto-detect
@@ -33,6 +34,8 @@ class CorridorKeySettings:
             raise ValueError(f"inference_size must be one of {VALID_INFERENCE_SIZES}.")
         if self.compute_qc not in {"Off", "On"}:
             raise ValueError("compute_qc must be 'Off' or 'On'.")
+        if self.compute_processed not in {"Off", "On"}:
+            raise ValueError("compute_processed must be 'Off' or 'On'.")
 
     @property
     def input_is_linear(self) -> bool:
@@ -45,3 +48,7 @@ class CorridorKeySettings:
     @property
     def qc_enabled(self) -> bool:
         return self.compute_qc == "On"
+
+    @property
+    def processed_enabled(self) -> bool:
+        return self.compute_processed == "On"

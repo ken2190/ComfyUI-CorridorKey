@@ -139,6 +139,15 @@ class CorridorKey:
                         ),
                     },
                 ),
+                "compute_processed": (
+                    ["On", "Off"],
+                    {
+                        "tooltip": (
+                            "Generate the premultiplied foreground output. "
+                            "Turn Off to save ~3GB RAM per 120 frames at 1080p when not needed."
+                        ),
+                    },
+                ),
                 "batch_size": (
                     "INT",
                     {
@@ -191,7 +200,8 @@ class CorridorKey:
         auto_despeckle: str,
         despeckle_size: int,
         inference_size: int = 2048,
-        compute_qc: str = "On",
+        compute_qc: str = "Off",
+        compute_processed: str = "Off",
         batch_size: int = 1,
         num_gpus: int = 0,
         unique_id: str | None = None,
@@ -204,6 +214,7 @@ class CorridorKey:
             despeckle_size=int(despeckle_size),
             inference_size=int(inference_size),
             compute_qc=str(compute_qc),
+            compute_processed=str(compute_processed),
             batch_size=int(batch_size),
             num_gpus=int(num_gpus),
         )

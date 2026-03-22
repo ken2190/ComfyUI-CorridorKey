@@ -232,58 +232,67 @@ class CorridorKeyEngine:
         auto_despeckle: bool = True,
         despeckle_size: int = 400,
         compute_qc: bool = False,
+        compute_processed: bool = False,
     ) -> dict[str, np.ndarray]:
-        """Post-process a single frame's model output (GPU tensors [C,H,W]) into numpy results."""
+        """Post-process a single frame's model output (GPU tensors [C,H,W]) into numpy results.
+
+        When compute_processed=False and compute_qc=False, skips despill/premultiply
+        entirely and returns 1×1 pixel placeholders for 'processed' and 'comp' outputs.
+        This saves ~6GB of CPU RAM for 120 frames at 1080p.
+        """
         height = alpha_chw.shape[1]
         width = alpha_chw.shape[2]
+        _PLACEHOLDER_RGB = np.zeros((1, 1, 3), dtype=np.float32)
 
         # Despeckle requires CPU/cv2
         if auto_despeckle:
             alpha_np = alpha_chw.permute(1, 2, 0).cpu().numpy()  # [H,W,1]
             processed_alpha_np = cu.clean_matte(alpha_np, area_threshold=despeckle_size, dilation=25, blur_size=5)
-            processed_alpha = torch.from_numpy(processed_alpha_np).to(self.device).permute(2, 0, 1)  # [1,H,W]
         else:
-            processed_alpha = alpha_chw  # [1,H,W]
+            processed_alpha_np = alpha_chw.permute(1, 2, 0).cpu().numpy()
 
-        # Despill on GPU
-        fg_hwc = fg_chw.permute(1, 2, 0)  # [H,W,3]
-        fg_despilled = cu.despill(fg_hwc, green_limit_mode="average", strength=despill_strength)
-
-        # Color space conversions on GPU
-        fg_despilled_linear = cu.srgb_to_linear(fg_despilled)
-        alpha_hwc = processed_alpha.permute(1, 2, 0)  # [H,W,1]
-        fg_premul_linear = cu.premultiply(fg_despilled_linear, alpha_hwc)
-
-        # Move to CPU numpy
+        # fg and matte are always needed
         fg_out = fg_chw.permute(1, 2, 0).cpu().numpy().astype(np.float32)
-        matte_out = processed_alpha[0].cpu().numpy().astype(np.float32)
+        matte_out = processed_alpha_np.astype(np.float32)
         if matte_out.ndim == 2:
             matte_out = matte_out[:, :, np.newaxis]
-        processed_out = fg_premul_linear.cpu().numpy().astype(np.float32)
 
         result = {
             "fg": np.clip(fg_out, 0.0, 1.0),
             "matte": np.clip(matte_out, 0.0, 1.0),
-            "processed": np.clip(processed_out, 0.0, 1.0),
         }
 
-        if compute_qc:
-            checkerboard_srgb = cu.create_checkerboard(width, height, checker_size=128, color1=0.15, color2=0.55)
-            checkerboard_linear = cu.srgb_to_linear(checkerboard_srgb)
-            comp_linear = cu.composite_straight(
-                fg_despilled_linear.cpu().numpy().astype(np.float32),
-                checkerboard_linear,
-                matte_out,
-            )
-            comp_srgb = cu.linear_to_srgb(comp_linear)
-            result["comp"] = np.clip(comp_srgb.astype(np.float32), 0.0, 1.0)
-        else:
-            result["comp"] = np.zeros((height, width, 3), dtype=np.float32)
+        # Only compute despill/premultiply/QC if actually needed
+        if compute_processed or compute_qc:
+            fg_hwc = fg_chw.permute(1, 2, 0)  # GPU [H,W,3]
+            fg_despilled = cu.despill(fg_hwc, green_limit_mode="average", strength=despill_strength)
+            fg_despilled_linear = cu.srgb_to_linear(fg_despilled)
+            del fg_hwc, fg_despilled
 
-        # Free GPU tensors from this frame
-        del fg_hwc, fg_despilled, fg_despilled_linear, alpha_hwc, fg_premul_linear
-        if auto_despeckle:
-            del processed_alpha
+            if compute_processed:
+                alpha_t = torch.from_numpy(matte_out).to(self.device)
+                fg_dl_t = fg_despilled_linear if isinstance(fg_despilled_linear, torch.Tensor) else torch.from_numpy(fg_despilled_linear).to(self.device)
+                fg_premul = cu.premultiply(fg_dl_t, alpha_t)
+                result["processed"] = np.clip(fg_premul.cpu().numpy().astype(np.float32), 0.0, 1.0)
+                del alpha_t, fg_dl_t, fg_premul
+            else:
+                result["processed"] = _PLACEHOLDER_RGB
+
+            if compute_qc:
+                fg_dl_np = fg_despilled_linear.cpu().numpy().astype(np.float32) if isinstance(fg_despilled_linear, torch.Tensor) else fg_despilled_linear.astype(np.float32)
+                checkerboard_srgb = cu.create_checkerboard(width, height, checker_size=128, color1=0.15, color2=0.55)
+                checkerboard_linear = cu.srgb_to_linear(checkerboard_srgb)
+                comp_linear = cu.composite_straight(fg_dl_np, checkerboard_linear, matte_out)
+                comp_srgb = cu.linear_to_srgb(comp_linear)
+                result["comp"] = np.clip(comp_srgb.astype(np.float32), 0.0, 1.0)
+            else:
+                result["comp"] = _PLACEHOLDER_RGB
+
+            del fg_despilled_linear
+        else:
+            # Skip all expensive post-processing — saves significant RAM
+            result["processed"] = _PLACEHOLDER_RGB
+            result["comp"] = _PLACEHOLDER_RGB
 
         return result
 
@@ -297,7 +306,8 @@ class CorridorKeyEngine:
         despill_strength: float = 1.0,
         auto_despeckle: bool = True,
         despeckle_size: int = 400,
-        compute_qc: bool = True,
+        compute_qc: bool = False,
+        compute_processed: bool = False,
     ) -> dict[str, np.ndarray]:
         """GPU-resident single-frame processing. Kept for compatibility and single-GPU path."""
         if image.dtype == np.uint8:
@@ -314,6 +324,7 @@ class CorridorKeyEngine:
             auto_despeckle=auto_despeckle,
             despeckle_size=despeckle_size,
             compute_qc=compute_qc,
+            compute_processed=compute_processed,
         )
         del alpha, fg
         if self.device.type == "cuda":
@@ -331,6 +342,7 @@ class CorridorKeyEngine:
         auto_despeckle: bool = True,
         despeckle_size: int = 400,
         compute_qc: bool = False,
+        compute_processed: bool = False,
     ) -> list[dict[str, np.ndarray]]:
         """Batched inference: run N frames through the model in one forward pass,
         then post-process each frame individually."""
@@ -363,6 +375,7 @@ class CorridorKeyEngine:
                 auto_despeckle=auto_despeckle,
                 despeckle_size=despeckle_size,
                 compute_qc=compute_qc,
+                compute_processed=compute_processed,
             )
             results.append(result)
 

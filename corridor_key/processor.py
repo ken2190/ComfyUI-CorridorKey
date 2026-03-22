@@ -38,6 +38,7 @@ def _process_mini_batch_on_engine(
         auto_despeckle=settings.despeckle_enabled,
         despeckle_size=settings.despeckle_size,
         compute_qc=settings.qc_enabled,
+        compute_processed=settings.processed_enabled,
     )
 
 
