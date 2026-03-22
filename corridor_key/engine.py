@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from . import color_utils as cu
 from .model_transformer import GreenFormer
+
+LOGGER = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = PROJECT_ROOT / "models"
@@ -90,8 +94,14 @@ class CorridorKeyEngine:
         self.use_refiner = use_refiner
         self.channels_last = self.device.type == "cuda" and _prefer_channels_last()
 
+        # Numpy mean/std for legacy process_frame
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+
+        # GPU-resident mean/std tensors for process_frame_tensor (shape: [1, 3, 1, 1])
+        self.mean_t = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1).to(self.device)
+        self.std_t = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1).to(self.device)
+
         _configure_torch_for_inference(self.device.type)
         self.model = self._load_model()
 
@@ -124,6 +134,132 @@ class CorridorKeyEngine:
         return nullcontext()
 
     @torch.no_grad()
+    def process_frame_tensor(
+        self,
+        image: np.ndarray,
+        mask_linear: np.ndarray,
+        refiner_scale: float = 1.0,
+        input_is_linear: bool = False,
+        despill_strength: float = 1.0,
+        auto_despeckle: bool = True,
+        despeckle_size: int = 400,
+        compute_qc: bool = True,
+    ) -> dict[str, np.ndarray]:
+        """GPU-resident processing path. Keeps tensors on GPU as long as possible,
+        only moving to CPU for the final output and for despeckle (which needs cv2).
+        """
+        if image.dtype == np.uint8:
+            image = image.astype(np.float32) / 255.0
+        else:
+            image = image.astype(np.float32)
+
+        if mask_linear.dtype == np.uint8:
+            mask_linear = mask_linear.astype(np.float32) / 255.0
+        elif mask_linear.dtype == np.uint16:
+            mask_linear = mask_linear.astype(np.float32) / 65535.0
+        else:
+            mask_linear = mask_linear.astype(np.float32)
+
+        height, width = image.shape[:2]
+
+        if mask_linear.ndim == 2:
+            mask_linear = mask_linear[:, :, np.newaxis]
+
+        # Move to GPU as [1, C, H, W]
+        img_t = torch.from_numpy(image).to(self.device).permute(2, 0, 1).unsqueeze(0)  # [1,3,H,W]
+        mask_t = torch.from_numpy(mask_linear).to(self.device).permute(2, 0, 1).unsqueeze(0)  # [1,1,H,W]
+
+        # Resize on GPU
+        img_resized = F.interpolate(img_t, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
+        mask_resized = F.interpolate(mask_t, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
+
+        # Linear→sRGB if needed (on GPU)
+        if input_is_linear:
+            img_resized = cu.linear_to_srgb(img_resized)
+
+        # Normalize on GPU using pre-built tensors
+        img_norm = (img_resized - self.mean_t) / self.std_t
+        input_tensor = torch.cat([img_norm, mask_resized], dim=1)  # [1, 4, img_size, img_size]
+
+        if self.channels_last:
+            input_tensor = input_tensor.to(memory_format=torch.channels_last)
+
+        # Refiner scale hook
+        hook_handle = None
+        if refiner_scale != 1.0 and self.model.refiner is not None:
+            def scale_hook(_module, _inputs, output):
+                return output * refiner_scale
+            hook_handle = self.model.refiner.register_forward_hook(scale_hook)
+
+        with self._autocast_context():
+            output = self.model(input_tensor)
+
+        if hook_handle is not None:
+            hook_handle.remove()
+
+        pred_alpha = output["alpha"]  # [1,1,img_size,img_size]
+        pred_fg = output["fg"]  # [1,3,img_size,img_size]
+
+        # Resize back to original resolution on GPU
+        resized_alpha = F.interpolate(pred_alpha, size=(height, width), mode="bilinear", align_corners=False)
+        resized_fg = F.interpolate(pred_fg, size=(height, width), mode="bilinear", align_corners=False)
+
+        # Free inference tensors
+        del input_tensor, pred_alpha, pred_fg, img_norm, img_resized, mask_resized, img_t, mask_t
+
+        # Despeckle requires CPU/cv2 - only move alpha to CPU for this
+        if auto_despeckle:
+            alpha_np = resized_alpha[0].permute(1, 2, 0).cpu().numpy()
+            processed_alpha_np = cu.clean_matte(alpha_np, area_threshold=despeckle_size, dilation=25, blur_size=5)
+            processed_alpha = torch.from_numpy(processed_alpha_np).to(self.device).permute(2, 0, 1).unsqueeze(0)
+        else:
+            processed_alpha = resized_alpha
+
+        # Despill on GPU: resized_fg is [1,3,H,W], work in HWC for color_utils
+        fg_hwc = resized_fg[0].permute(1, 2, 0)  # [H,W,3] GPU tensor
+        fg_despilled = cu.despill(fg_hwc, green_limit_mode="average", strength=despill_strength)
+
+        # Color space conversions on GPU
+        fg_despilled_linear = cu.srgb_to_linear(fg_despilled)
+        alpha_hwc = processed_alpha[0, 0:1].permute(1, 2, 0)  # [H,W,1]
+        fg_premul_linear = cu.premultiply(fg_despilled_linear, alpha_hwc)
+
+        # Move results to CPU numpy
+        fg_out = resized_fg[0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+        matte_out = processed_alpha[0, 0].cpu().numpy().astype(np.float32)
+        if matte_out.ndim == 2:
+            matte_out = matte_out[:, :, np.newaxis]
+        processed_out = fg_premul_linear.cpu().numpy().astype(np.float32)
+
+        result = {
+            "fg": np.clip(fg_out, 0.0, 1.0),
+            "matte": np.clip(matte_out, 0.0, 1.0),
+            "processed": np.clip(processed_out, 0.0, 1.0),
+        }
+
+        # QC checkerboard composite (skip if not needed to save time/memory)
+        if compute_qc:
+            checkerboard_srgb = cu.create_checkerboard(width, height, checker_size=128, color1=0.15, color2=0.55)
+            checkerboard_linear = cu.srgb_to_linear(checkerboard_srgb)
+            comp_linear = cu.composite_straight(
+                fg_despilled_linear.cpu().numpy().astype(np.float32),
+                checkerboard_linear,
+                matte_out,
+            )
+            comp_srgb = cu.linear_to_srgb(comp_linear)
+            result["comp"] = np.clip(comp_srgb.astype(np.float32), 0.0, 1.0)
+        else:
+            result["comp"] = np.zeros((height, width, 3), dtype=np.float32)
+
+        # Free GPU tensors
+        del resized_alpha, resized_fg, processed_alpha, fg_hwc, fg_despilled, fg_despilled_linear, alpha_hwc, fg_premul_linear
+
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        return result
+
+    @torch.no_grad()
     def process_frame(
         self,
         image: np.ndarray,
@@ -135,6 +271,7 @@ class CorridorKeyEngine:
         auto_despeckle: bool = True,
         despeckle_size: int = 400,
     ) -> dict[str, np.ndarray]:
+        """Legacy numpy-based processing path. Kept for compatibility."""
         cv2 = _import_cv2()
 
         if image.dtype == np.uint8:

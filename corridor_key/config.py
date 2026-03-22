@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+VALID_INFERENCE_SIZES = (768, 1024, 1536, 2048)
+
 
 @dataclass(frozen=True, slots=True)
 class CorridorKeySettings:
@@ -10,6 +12,9 @@ class CorridorKeySettings:
     refiner_strength: float = 1.0
     auto_despeckle: str = "On"
     despeckle_size: int = 400
+    inference_size: int = 2048
+    compute_qc: str = "On"
+    chunk_size: int = 50
 
     def __post_init__(self) -> None:
         if self.gamma_space not in {"sRGB", "Linear"}:
@@ -22,6 +27,10 @@ class CorridorKeySettings:
             raise ValueError("auto_despeckle must be 'Off' or 'On'.")
         if not 0 <= self.despeckle_size <= 4096:
             raise ValueError("despeckle_size must be between 0 and 4096.")
+        if self.inference_size not in VALID_INFERENCE_SIZES:
+            raise ValueError(f"inference_size must be one of {VALID_INFERENCE_SIZES}.")
+        if self.compute_qc not in {"Off", "On"}:
+            raise ValueError("compute_qc must be 'Off' or 'On'.")
 
     @property
     def input_is_linear(self) -> bool:
@@ -30,3 +39,7 @@ class CorridorKeySettings:
     @property
     def despeckle_enabled(self) -> bool:
         return self.auto_despeckle == "On"
+
+    @property
+    def qc_enabled(self) -> bool:
+        return self.compute_qc == "On"

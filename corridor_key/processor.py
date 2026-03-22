@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gc
 import logging
 from typing import Callable
 
+import numpy as np
 import torch
 
 from .config import CorridorKeySettings
@@ -41,44 +43,87 @@ class CorridorKeyProcessor:
         )
 
         total_frames = int(image_batch.shape[0])
+        chunk_size = settings.chunk_size
+
         if progress_callback is not None:
-            progress_callback("Loading CorridorKey model...", 0, total_frames)
+            progress_callback(
+                f"Loading CorridorKey model (inference_size={settings.inference_size})...",
+                0,
+                total_frames,
+            )
 
-        engine = get_cached_engine(device=self._device)
-
-        fg_frames: list = []
-        matte_frames: list = []
-        processed_frames: list = []
-        comp_frames: list = []
+        engine = get_cached_engine(
+            device=self._device,
+            img_size=settings.inference_size,
+        )
 
         image_frames = batch_to_numpy(image_batch)
         mask_frames = batch_to_numpy(mask_batch)
 
-        for frame_index, (image_frame, mask_frame) in enumerate(zip(image_frames, mask_frames, strict=True), start=1):
-            if progress_callback is not None:
-                progress_callback(f"Processing frame {frame_index}/{total_frames}...", frame_index - 1, total_frames)
+        # Free the original batched tensors to reduce peak memory
+        del image_batch, mask_batch
 
-            result = engine.process_frame(
-                image=image_frame,
-                mask_linear=mask_frame,
-                refiner_scale=settings.refiner_strength,
-                input_is_linear=settings.input_is_linear,
-                despill_strength=settings.despill_strength,
-                auto_despeckle=settings.despeckle_enabled,
-                despeckle_size=settings.despeckle_size,
+        # Process frames in chunks to cap peak memory
+        all_fg: list[torch.Tensor] = []
+        all_matte: list[torch.Tensor] = []
+        all_processed: list[torch.Tensor] = []
+        all_comp: list[torch.Tensor] = []
+
+        for chunk_start in range(0, total_frames, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, total_frames)
+            chunk_fg: list[np.ndarray] = []
+            chunk_matte: list[np.ndarray] = []
+            chunk_processed: list[np.ndarray] = []
+            chunk_comp: list[np.ndarray] = []
+
+            for frame_index in range(chunk_start, chunk_end):
+                global_idx = frame_index + 1
+                if progress_callback is not None:
+                    progress_callback(
+                        f"Processing frame {global_idx}/{total_frames}...",
+                        frame_index,
+                        total_frames,
+                    )
+
+                result = engine.process_frame_tensor(
+                    image=image_frames[frame_index],
+                    mask_linear=mask_frames[frame_index],
+                    refiner_scale=settings.refiner_strength,
+                    input_is_linear=settings.input_is_linear,
+                    despill_strength=settings.despill_strength,
+                    auto_despeckle=settings.despeckle_enabled,
+                    despeckle_size=settings.despeckle_size,
+                    compute_qc=settings.qc_enabled,
+                )
+                chunk_fg.append(result["fg"])
+                chunk_matte.append(result["matte"])
+                chunk_processed.append(result["processed"])
+                chunk_comp.append(result["comp"])
+                LOGGER.debug("CorridorKey processed frame %s", global_idx)
+
+            # Stack chunk into tensors immediately and free numpy lists
+            all_fg.append(stack_rgb_frames(chunk_fg))
+            all_matte.append(stack_mask_frames(chunk_matte))
+            all_processed.append(stack_rgb_frames(chunk_processed))
+            all_comp.append(stack_rgb_frames(chunk_comp))
+
+            del chunk_fg, chunk_matte, chunk_processed, chunk_comp
+            gc.collect()
+
+            LOGGER.info(
+                "CorridorKey chunk %d-%d/%d done, stacked to tensor.",
+                chunk_start + 1,
+                chunk_end,
+                total_frames,
             )
-            fg_frames.append(result["fg"])
-            matte_frames.append(result["matte"])
-            processed_frames.append(result["processed"])
-            comp_frames.append(result["comp"])
-            LOGGER.debug("CorridorKey processed frame %s", frame_index)
 
         if progress_callback is not None:
             progress_callback("CorridorKey complete.", total_frames, total_frames)
 
+        # Concatenate all chunk tensors
         return (
-            stack_rgb_frames(fg_frames),
-            stack_mask_frames(matte_frames),
-            stack_rgb_frames(processed_frames),
-            stack_rgb_frames(comp_frames),
+            torch.cat(all_fg, dim=0) if len(all_fg) > 1 else all_fg[0],
+            torch.cat(all_matte, dim=0) if len(all_matte) > 1 else all_matte[0],
+            torch.cat(all_processed, dim=0) if len(all_processed) > 1 else all_processed[0],
+            torch.cat(all_comp, dim=0) if len(all_comp) > 1 else all_comp[0],
         )

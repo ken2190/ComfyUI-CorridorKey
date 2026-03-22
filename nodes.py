@@ -4,15 +4,16 @@ from typing import Callable
 
 try:
     from .corridor_key import CorridorKeyProcessor, CorridorKeySettings
+    from .corridor_key.config import VALID_INFERENCE_SIZES
 except ImportError:
     from corridor_key import CorridorKeyProcessor, CorridorKeySettings
+    from corridor_key.config import VALID_INFERENCE_SIZES
 
 
 def _build_progress_reporter(unique_id: str | None) -> Callable[[str, int, int], None]:
     progress_bar = None
     prompt_server = None
 
-    # Mini title: best-effort ComfyUI progress hooks
     try:
         from comfy.utils import ProgressBar
 
@@ -76,7 +77,7 @@ class CorridorKey:
                 "gamma_space": (
                     ["sRGB", "Linear"],
                     {
-                        "tooltip": "Interpret the incoming image as sRGB or already-linear before the fixed 2048x2048 inference pass.",
+                        "tooltip": "Interpret the incoming image as sRGB or already-linear before inference.",
                     },
                 ),
                 "despill_strength": (
@@ -115,7 +116,27 @@ class CorridorKey:
                         "min": 0,
                         "max": 4096,
                         "step": 1,
-                        "tooltip": "Minimum island area in pixels to preserve when auto-despeckle is enabled. 400 is the standard default.",
+                        "tooltip": "Minimum island area in pixels to preserve when auto-despeckle is enabled.",
+                    },
+                ),
+                "inference_size": (
+                    list(VALID_INFERENCE_SIZES),
+                    {
+                        "default": 2048,
+                        "tooltip": (
+                            "Resolution for the transformer inference pass. "
+                            "2048 = highest quality (default), 1024 = ~4x faster, 768 = ~7x faster. "
+                            "Lower values reduce quality but drastically cut processing time and VRAM."
+                        ),
+                    },
+                ),
+                "compute_qc": (
+                    ["On", "Off"],
+                    {
+                        "tooltip": (
+                            "Generate the QC checkerboard composite output. "
+                            "Turn Off to save time and memory when the QC preview is not needed."
+                        ),
                     },
                 ),
             },
@@ -141,6 +162,8 @@ class CorridorKey:
         refiner_strength: float,
         auto_despeckle: str,
         despeckle_size: int,
+        inference_size: int = 2048,
+        compute_qc: str = "On",
         unique_id: str | None = None,
     ):
         settings = CorridorKeySettings(
@@ -149,6 +172,8 @@ class CorridorKey:
             refiner_strength=float(refiner_strength),
             auto_despeckle=str(auto_despeckle),
             despeckle_size=int(despeckle_size),
+            inference_size=int(inference_size),
+            compute_qc=str(compute_qc),
         )
         progress_callback = _build_progress_reporter(unique_id)
         return self._processor.refine(
