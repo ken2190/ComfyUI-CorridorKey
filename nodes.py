@@ -4,10 +4,10 @@ from typing import Callable
 
 try:
     from .corridor_key import CorridorKeyProcessor, CorridorKeySettings
-    from .corridor_key.config import VALID_INFERENCE_SIZES
+    from .corridor_key.config import VALID_BACKENDS, VALID_INFERENCE_SIZES
 except ImportError:
     from corridor_key import CorridorKeyProcessor, CorridorKeySettings
-    from corridor_key.config import VALID_INFERENCE_SIZES
+    from corridor_key.config import VALID_BACKENDS, VALID_INFERENCE_SIZES
 
 
 def _build_progress_reporter(unique_id: str | None) -> Callable[[str, int, int], None]:
@@ -176,6 +176,19 @@ class CorridorKey:
                         ),
                     },
                 ),
+                "backend": (
+                    list(VALID_BACKENDS),
+                    {
+                        "default": "auto",
+                        "tooltip": (
+                            "Inference backend. "
+                            "'auto' tries TensorRT (fastest) then falls back to PyTorch. "
+                            "'tensorrt' forces ONNX Runtime + TensorRT EP (FP16, 30-50%% faster on V100). "
+                            "'pytorch' uses the original PyTorch path. "
+                            "First TensorRT run exports ONNX and builds the engine (5-15 min, cached after)."
+                        ),
+                    },
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -204,6 +217,7 @@ class CorridorKey:
         compute_processed: str = "Off",
         batch_size: int = 1,
         num_gpus: int = 0,
+        backend: str = "auto",
         unique_id: str | None = None,
     ):
         settings = CorridorKeySettings(
@@ -217,6 +231,7 @@ class CorridorKey:
             compute_processed=str(compute_processed),
             batch_size=int(batch_size),
             num_gpus=int(num_gpus),
+            backend=str(backend),
         )
         progress_callback = _build_progress_reporter(unique_id)
         return self._processor.refine(

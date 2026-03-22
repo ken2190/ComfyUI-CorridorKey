@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 VALID_INFERENCE_SIZES = (768, 1024, 1536, 2048)
+VALID_BACKENDS = ("auto", "tensorrt", "pytorch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +19,7 @@ class CorridorKeySettings:
     chunk_size: int = 50
     batch_size: int = 1
     num_gpus: int = 0  # 0 = auto-detect
+    backend: str = "auto"  # "auto", "tensorrt", or "pytorch"
 
     def __post_init__(self) -> None:
         if self.gamma_space not in {"sRGB", "Linear"}:
@@ -36,6 +38,8 @@ class CorridorKeySettings:
             raise ValueError("compute_qc must be 'Off' or 'On'.")
         if self.compute_processed not in {"Off", "On"}:
             raise ValueError("compute_processed must be 'Off' or 'On'.")
+        if self.backend not in VALID_BACKENDS:
+            raise ValueError(f"backend must be one of {VALID_BACKENDS}.")
 
     @property
     def input_is_linear(self) -> bool:

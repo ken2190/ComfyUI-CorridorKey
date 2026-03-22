@@ -81,7 +81,7 @@ class CorridorKeyProcessor:
         if progress_callback is not None:
             progress_callback(
                 f"Loading CorridorKey (size={settings.inference_size}, "
-                f"gpus={num_gpus}, batch={batch_size})...",
+                f"gpus={num_gpus}, batch={batch_size}, backend={settings.backend})...",
                 0,
                 total_frames,
             )
@@ -91,11 +91,13 @@ class CorridorKeyProcessor:
             engines = [get_cached_engine(
                 device=self._device,
                 img_size=settings.inference_size,
+                backend=settings.backend,
             )]
         else:
             engines = get_multi_gpu_engines(
                 img_size=settings.inference_size,
                 num_gpus=num_gpus,
+                backend=settings.backend,
             )
 
         LOGGER.info(

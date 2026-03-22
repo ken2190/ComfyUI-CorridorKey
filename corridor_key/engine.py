@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = PROJECT_ROOT / "models"
 DEFAULT_CHECKPOINT_NAME = "CorridorKey.pth"
 CHECKPOINT_DOWNLOAD_URL = "https://huggingface.co/nikopueringer/CorridorKey_v1.0/resolve/main/CorridorKey_v1.0.pth"
-_ENGINE_CACHE: dict[tuple[str, str, int, bool], "CorridorKeyEngine"] = {}
+_ENGINE_CACHE: dict[tuple, "CorridorKeyEngine"] = {}
 
 
 def _import_cv2():
@@ -101,11 +101,13 @@ class CorridorKeyEngine:
         device: str | None = None,
         img_size: int = 2048,
         use_refiner: bool = True,
+        backend: str = "auto",
     ) -> None:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.img_size = img_size
         self.checkpoint_path = Path(checkpoint_path)
         self.use_refiner = use_refiner
+        self.backend = backend
         self.channels_last = self.device.type == "cuda" and _prefer_channels_last()
 
         # Numpy mean/std for legacy process_frame
@@ -119,6 +121,10 @@ class CorridorKeyEngine:
         _configure_torch_for_inference(self.device.type)
         self.model = self._load_model()
         self._compiled = False
+
+        # ORT/TRT session — lazily initialized on first inference
+        self._ort_session = None
+        self._ort_init_attempted = False
 
     def _load_model(self) -> GreenFormer:
         model = GreenFormer(
@@ -157,6 +163,37 @@ class CorridorKeyEngine:
         if self.device.type == "cuda":
             return torch.autocast(device_type="cuda", dtype=torch.float16)
         return nullcontext()
+
+    def _get_ort_session(self, max_batch: int = 4):
+        """Lazily initialize ORT/TRT session. Returns session or None."""
+        if self._ort_init_attempted:
+            return self._ort_session
+        self._ort_init_attempted = True
+
+        if self.backend == "pytorch" or self.device.type != "cuda":
+            return None
+
+        try:
+            from .onnx_trt_backend import get_ort_session
+            device_id = self.device.index if self.device.index is not None else 0
+            self._ort_session = get_ort_session(
+                model=self.model,
+                models_dir=MODELS_DIR,
+                device_id=device_id,
+                img_size=self.img_size,
+                max_batch=max_batch,
+            )
+            if self._ort_session is not None:
+                LOGGER.info(
+                    "TRT backend active: provider=%s, device=%s",
+                    self._ort_session.active_provider, self.device,
+                )
+        except Exception as e:
+            LOGGER.warning("ORT/TRT backend init failed, using PyTorch: %s", e)
+            if self.backend == "tensorrt":
+                raise  # User explicitly requested TRT — don't silently degrade
+
+        return self._ort_session
 
     @torch.no_grad()
     def _run_model_batch(
@@ -202,28 +239,39 @@ class CorridorKeyEngine:
         input_tensor = torch.cat([img_norm, mask_resized], dim=1)  # [N,4,S,S]
         del img_resized, mask_resized, img_norm
 
-        if self.channels_last:
-            input_tensor = input_tensor.to(memory_format=torch.channels_last)
+        # Try ORT/TRT backend (skip when refiner_scale != 1.0 — hook can't work with ORT)
+        ort_session = self._get_ort_session(max_batch=n) if refiner_scale == 1.0 else None
 
-        # Refiner scale hook
-        hook_handle = None
-        if refiner_scale != 1.0 and self.model.refiner is not None:
-            def scale_hook(_module, _inputs, output):
-                return output * refiner_scale
-            hook_handle = self.model.refiner.register_forward_hook(scale_hook)
+        if ort_session is not None:
+            # ORT/TRT path: zero-copy GPU inference via IO binding
+            alpha_raw, fg_raw = ort_session(input_tensor)
+        else:
+            # PyTorch path (fallback or refiner_scale != 1.0)
+            if self.channels_last:
+                input_tensor = input_tensor.to(memory_format=torch.channels_last)
 
-        with self._autocast_context():
-            output = self.model(input_tensor)
+            hook_handle = None
+            if refiner_scale != 1.0 and self.model.refiner is not None:
+                def scale_hook(_module, _inputs, output):
+                    return output * refiner_scale
+                hook_handle = self.model.refiner.register_forward_hook(scale_hook)
 
-        if hook_handle is not None:
-            hook_handle.remove()
+            with self._autocast_context():
+                output = self.model(input_tensor)
+
+            if hook_handle is not None:
+                hook_handle.remove()
+
+            alpha_raw = output["alpha"]
+            fg_raw = output["fg"]
+            del output
 
         del input_tensor
 
         # Resize back to original resolution on GPU
-        alpha = F.interpolate(output["alpha"], size=(height, width), mode="bilinear", align_corners=False)
-        fg = F.interpolate(output["fg"], size=(height, width), mode="bilinear", align_corners=False)
-        del output
+        alpha = F.interpolate(alpha_raw, size=(height, width), mode="bilinear", align_corners=False)
+        fg = F.interpolate(fg_raw, size=(height, width), mode="bilinear", align_corners=False)
+        del alpha_raw, fg_raw
 
         return alpha, fg  # [N,1,H,W], [N,3,H,W]
 
@@ -488,9 +536,14 @@ class CorridorKeyEngine:
         }
 
 
-def get_cached_engine(device: str | None = None, img_size: int = 2048, use_refiner: bool = True) -> CorridorKeyEngine:
+def get_cached_engine(
+    device: str | None = None,
+    img_size: int = 2048,
+    use_refiner: bool = True,
+    backend: str = "auto",
+) -> CorridorKeyEngine:
     checkpoint_path = resolve_checkpoint_path()
-    cache_key = (str(checkpoint_path), device or "", img_size, use_refiner)
+    cache_key = (str(checkpoint_path), device or "", img_size, use_refiner, backend)
     cached = _ENGINE_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -500,20 +553,26 @@ def get_cached_engine(device: str | None = None, img_size: int = 2048, use_refin
         device=device,
         img_size=img_size,
         use_refiner=use_refiner,
+        backend=backend,
     )
     _ENGINE_CACHE[cache_key] = engine
     return engine
 
 
-def get_multi_gpu_engines(img_size: int = 2048, num_gpus: int = 0, use_refiner: bool = True) -> list[CorridorKeyEngine]:
+def get_multi_gpu_engines(
+    img_size: int = 2048,
+    num_gpus: int = 0,
+    use_refiner: bool = True,
+    backend: str = "auto",
+) -> list[CorridorKeyEngine]:
     """Create one engine per GPU. num_gpus=0 means auto-detect all available GPUs."""
     available = get_available_gpu_count()
     if available == 0:
-        return [get_cached_engine(device="cpu", img_size=img_size, use_refiner=use_refiner)]
+        return [get_cached_engine(device="cpu", img_size=img_size, use_refiner=use_refiner, backend=backend)]
 
     target = available if num_gpus <= 0 else min(num_gpus, available)
     engines = []
     for gpu_idx in range(target):
         device = f"cuda:{gpu_idx}"
-        engines.append(get_cached_engine(device=device, img_size=img_size, use_refiner=use_refiner))
+        engines.append(get_cached_engine(device=device, img_size=img_size, use_refiner=use_refiner, backend=backend))
     return engines
