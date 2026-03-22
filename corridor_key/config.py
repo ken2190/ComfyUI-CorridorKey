@@ -15,6 +15,8 @@ class CorridorKeySettings:
     inference_size: int = 2048
     compute_qc: str = "On"
     chunk_size: int = 50
+    batch_size: int = 1
+    num_gpus: int = 0  # 0 = auto-detect
 
     def __post_init__(self) -> None:
         if self.gamma_space not in {"sRGB", "Linear"}:

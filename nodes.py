@@ -139,6 +139,34 @@ class CorridorKey:
                         ),
                     },
                 ),
+                "batch_size": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 8,
+                        "step": 1,
+                        "tooltip": (
+                            "Number of frames per model forward pass. "
+                            "Higher values use more VRAM but can be faster. "
+                            "At 2048: batch=2 needs ~20GB VRAM per GPU. Start with 1 and increase if VRAM allows."
+                        ),
+                    },
+                ),
+                "num_gpus": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 16,
+                        "step": 1,
+                        "tooltip": (
+                            "Number of GPUs to use for parallel frame processing. "
+                            "0 = auto-detect all available GPUs. "
+                            "Frames are distributed round-robin across GPUs for near-linear speedup."
+                        ),
+                    },
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -164,6 +192,8 @@ class CorridorKey:
         despeckle_size: int,
         inference_size: int = 2048,
         compute_qc: str = "On",
+        batch_size: int = 1,
+        num_gpus: int = 0,
         unique_id: str | None = None,
     ):
         settings = CorridorKeySettings(
@@ -174,6 +204,8 @@ class CorridorKey:
             despeckle_size=int(despeckle_size),
             inference_size=int(inference_size),
             compute_qc=str(compute_qc),
+            batch_size=int(batch_size),
+            num_gpus=int(num_gpus),
         )
         progress_callback = _build_progress_reporter(unique_id)
         return self._processor.refine(
