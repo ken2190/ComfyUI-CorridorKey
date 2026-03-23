@@ -559,6 +559,37 @@ def get_cached_engine(
     return engine
 
 
+def free_all_engines() -> int:
+    """Destroy all cached engines, release GPU VRAM, and clear CUDA cache.
+    Returns the number of engines freed."""
+    count = len(_ENGINE_CACHE)
+    for key, engine in list(_ENGINE_CACHE.items()):
+        # Delete ORT session if present
+        if hasattr(engine, '_ort_session') and engine._ort_session is not None:
+            del engine._ort_session
+            engine._ort_session = None
+        # Delete model
+        if hasattr(engine, 'model') and engine.model is not None:
+            del engine.model
+            engine.model = None
+        # Delete GPU tensors
+        if hasattr(engine, 'mean_t'):
+            del engine.mean_t
+        if hasattr(engine, 'std_t'):
+            del engine.std_t
+    _ENGINE_CACHE.clear()
+
+    import gc
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+    LOGGER.info("Freed %d CorridorKey engine(s) and cleared CUDA cache.", count)
+    return count
+
+
 def get_multi_gpu_engines(
     img_size: int = 2048,
     num_gpus: int = 0,

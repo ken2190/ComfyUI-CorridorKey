@@ -3,10 +3,10 @@ from __future__ import annotations
 from typing import Callable
 
 try:
-    from .corridor_key import CorridorKeyProcessor, CorridorKeySettings
+    from .corridor_key import CorridorKeyProcessor, CorridorKeySettings, free_all_engines
     from .corridor_key.config import VALID_BACKENDS, VALID_INFERENCE_SIZES
 except ImportError:
-    from corridor_key import CorridorKeyProcessor, CorridorKeySettings
+    from corridor_key import CorridorKeyProcessor, CorridorKeySettings, free_all_engines
     from corridor_key.config import VALID_BACKENDS, VALID_INFERENCE_SIZES
 
 
@@ -189,6 +189,18 @@ class CorridorKey:
                         ),
                     },
                 ),
+                "unload_model": (
+                    ["Off", "On"],
+                    {
+                        "default": "Off",
+                        "tooltip": (
+                            "Unload the CorridorKey model from GPU after processing completes. "
+                            "Frees ~2-4GB VRAM so downstream nodes or subsequent runs don't OOM. "
+                            "The model will be reloaded automatically on the next run (adds ~5s). "
+                            "Turn On if you experience VRAM issues between runs."
+                        ),
+                    },
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -218,6 +230,7 @@ class CorridorKey:
         batch_size: int = 1,
         num_gpus: int = 0,
         backend: str = "auto",
+        unload_model: str = "Off",
         unique_id: str | None = None,
     ):
         settings = CorridorKeySettings(
@@ -234,9 +247,57 @@ class CorridorKey:
             backend=str(backend),
         )
         progress_callback = _build_progress_reporter(unique_id)
-        return self._processor.refine(
+        result = self._processor.refine(
             image=image,
             mask=mask,
             settings=settings,
             progress_callback=progress_callback,
         )
+
+        if unload_model == "On":
+            freed = free_all_engines()
+            print(f"[CorridorKey] Unloaded {freed} engine(s), VRAM freed.")
+
+        return result
+
+
+class CorridorKey_FreeVRAM:
+    """Utility node to force-free all CorridorKey models from GPU VRAM.
+
+    Place this anywhere in your workflow (connect any IMAGE through it).
+    When executed, it destroys all cached CorridorKey engines and clears
+    CUDA memory. The image passes through unchanged.
+
+    Use case: add after CorridorKey to reclaim VRAM for downstream nodes,
+    or run standalone to recover from OOM without restarting ComfyUI.
+    """
+
+    DESCRIPTION = (
+        "Force-free all CorridorKey models from GPU VRAM. "
+        "Pass-through node: the input image is returned unchanged. "
+        "Use after CorridorKey or standalone to recover from OOM."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple]]:
+        return {
+            "required": {
+                "images": (
+                    "IMAGE",
+                    {
+                        "tooltip": "Pass-through: images are returned unchanged after freeing VRAM.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "run"
+    CATEGORY = "CorridorKey"
+    OUTPUT_NODE = True
+
+    def run(self, images):
+        freed = free_all_engines()
+        print(f"[CorridorKey_FreeVRAM] Freed {freed} engine(s), CUDA cache cleared.")
+        return (images,)

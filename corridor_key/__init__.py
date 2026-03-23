@@ -1,4 +1,5 @@
 from .config import CorridorKeySettings
+from .engine import free_all_engines
 from .processor import CorridorKeyProcessor
 from .upstream_sync import (
     SYNCED_UPSTREAM_HEAD_CHECK_CONCLUSIONS,
@@ -14,6 +15,7 @@ from .upstream_sync import (
 __all__ = [
     "CorridorKeyProcessor",
     "CorridorKeySettings",
+    "free_all_engines",
     "SYNCED_UPSTREAM_HEAD_CHECK_CONCLUSIONS",
     "SYNCED_UPSTREAM_HEAD_DATE",
     "SYNCED_UPSTREAM_HEAD_MESSAGE",
