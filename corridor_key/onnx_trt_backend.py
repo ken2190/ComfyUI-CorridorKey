@@ -159,6 +159,16 @@ def find_onnx_model(models_dir: Path, img_size: int) -> Path | None:
 class OnnxTrtSession:
     """ONNX Runtime inference session with TensorRT or CUDA execution provider."""
 
+    @staticmethod
+    def _check_trt_available() -> bool:
+        """Check if TensorRT runtime (libnvinfer.so) is actually loadable."""
+        try:
+            import ctypes
+            ctypes.CDLL("libnvinfer.so")
+            return True
+        except OSError:
+            return False
+
     def __init__(
         self,
         onnx_path: Path,
@@ -183,27 +193,38 @@ class OnnxTrtSession:
 
         providers = []
 
-        # Try TensorRT EP first
-        trt_opts = {
-            "device_id": device_id,
-            "trt_fp16_enable": fp16,
-            "trt_engine_cache_enable": True,
-            "trt_engine_cache_path": str(cache_dir),
-            "trt_max_workspace_size": str(8 * 1024 ** 3),  # 8 GB
-            "trt_builder_optimization_level": "5",
-            "trt_profile_min_shapes": f"input:1x4x{img_size}x{img_size}",
-            "trt_profile_max_shapes": shape_str,
-            "trt_profile_opt_shapes": shape_str,
-        }
-        providers.append(("TensorrtExecutionProvider", trt_opts))
+        # Try TensorRT EP first (only if libnvinfer is actually available)
+        trt_available = self._check_trt_available()
 
-        # CUDA EP as fallback
-        cuda_opts = {
-            "device_id": device_id,
-            "arena_extend_strategy": "kSameAsRequested",
-            "cudnn_conv_algo_search": "EXHAUSTIVE",
-        }
-        providers.append(("CUDAExecutionProvider", cuda_opts))
+        if trt_available:
+            trt_opts = {
+                "device_id": device_id,
+                "trt_fp16_enable": fp16,
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": str(cache_dir),
+                "trt_max_workspace_size": str(8 * 1024 ** 3),  # 8 GB
+                "trt_builder_optimization_level": "5",
+                "trt_profile_min_shapes": f"input:1x4x{img_size}x{img_size}",
+                "trt_profile_max_shapes": shape_str,
+                "trt_profile_opt_shapes": shape_str,
+            }
+            providers.append(("TensorrtExecutionProvider", trt_opts))
+
+            # CUDA EP as fallback only when TRT is present (avoids 16GB Softmax OOM)
+            cuda_opts = {
+                "device_id": device_id,
+                "arena_extend_strategy": "kSameAsRequested",
+                "cudnn_conv_algo_search": "EXHAUSTIVE",
+            }
+            providers.append(("CUDAExecutionProvider", cuda_opts))
+        else:
+            # TRT not available — don't use ORT CUDA EP (it allocates ~16GB for
+            # Softmax at 2048, worse than PyTorch). Raise so caller falls back to PyTorch.
+            raise RuntimeError(
+                "TensorRT runtime (libnvinfer.so) not found. "
+                "ORT CUDA EP is not used as fallback because it consumes more VRAM than PyTorch. "
+                "Install TensorRT or use backend='pytorch'."
+            )
 
         LOGGER.info(
             "Creating ORT session (device=%d, size=%d, batch<=%d, fp16=%s)...",
@@ -347,3 +368,14 @@ def get_ort_session(
     except Exception:
         LOGGER.warning("Failed to create ORT/TRT session", exc_info=True)
         return None
+
+
+def free_ort_sessions() -> int:
+    """Destroy all cached ORT sessions and free their VRAM."""
+    count = len(_ORT_SESSION_CACHE)
+    for key, session in list(_ORT_SESSION_CACHE.items()):
+        if hasattr(session, '_session'):
+            del session._session
+    _ORT_SESSION_CACHE.clear()
+    LOGGER.info("Freed %d ORT session(s).", count)
+    return count

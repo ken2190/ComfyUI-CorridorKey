@@ -579,6 +579,13 @@ def free_all_engines() -> int:
             del engine.std_t
     _ENGINE_CACHE.clear()
 
+    # Also clear the separate ORT session cache in onnx_trt_backend
+    try:
+        from .onnx_trt_backend import free_ort_sessions
+        free_ort_sessions()
+    except Exception:
+        pass
+
     import gc
     gc.collect()
 
