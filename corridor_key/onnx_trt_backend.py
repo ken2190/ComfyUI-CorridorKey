@@ -160,21 +160,25 @@ _TRT_AVAILABLE: bool | None = None  # Module-level cache: None = not checked yet
 
 
 def _check_trt_available() -> bool:
-    """Check if TensorRT runtime (libnvinfer.so) is actually loadable.
+    """Check if TensorRT EP is available in ONNX Runtime.
     Result is cached globally so we only probe once per process."""
     global _TRT_AVAILABLE
     if _TRT_AVAILABLE is not None:
         return _TRT_AVAILABLE
     try:
-        import ctypes
-        ctypes.CDLL("libnvinfer.so")
-        _TRT_AVAILABLE = True
-        LOGGER.info("TensorRT runtime found (libnvinfer.so).")
-    except OSError:
+        import onnxruntime as ort
+        _TRT_AVAILABLE = "TensorrtExecutionProvider" in ort.get_available_providers()
+        if _TRT_AVAILABLE:
+            LOGGER.info("TensorRT EP available via ONNX Runtime.")
+        else:
+            LOGGER.warning(
+                "TensorRT EP not found in ORT providers. "
+                "TRT backend disabled. Install tensorrt-cu12 or use backend='pytorch'."
+            )
+    except Exception:
         _TRT_AVAILABLE = False
         LOGGER.warning(
-            "TensorRT runtime (libnvinfer.so) not found. "
-            "TRT backend disabled for this session. Install tensorrt-cu12 or use backend='pytorch'."
+            "onnxruntime not available. TRT backend disabled."
         )
     return _TRT_AVAILABLE
 
