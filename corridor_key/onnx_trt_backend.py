@@ -157,24 +157,51 @@ def find_onnx_model(models_dir: Path, img_size: int) -> Path | None:
 # ---------------------------------------------------------------------------
 
 _TRT_AVAILABLE: bool | None = None  # Module-level cache: None = not checked yet
+_TRT_SM_MIN = 70  # Minimum SM version for TensorRT. SM 70 (Volta/V100) supported by TRT <=10.4. SM <70 (Pascal) not supported.
+
+
+def _get_gpu_sm_version(device_id: int = 0) -> int:
+    """Return the SM version (e.g. 70 for V100, 75 for T4, 80 for A100) for a CUDA device.
+    Returns 0 if CUDA is not available."""
+    try:
+        if not torch.cuda.is_available():
+            return 0
+        major, minor = torch.cuda.get_device_capability(device_id)
+        return major * 10 + minor
+    except Exception:
+        return 0
 
 
 def _check_trt_available() -> bool:
-    """Check if TensorRT EP is available in ONNX Runtime.
+    """Check if TensorRT EP is available in ONNX Runtime AND the GPU SM version is supported.
     Result is cached globally so we only probe once per process."""
     global _TRT_AVAILABLE
     if _TRT_AVAILABLE is not None:
         return _TRT_AVAILABLE
     try:
         import onnxruntime as ort
-        _TRT_AVAILABLE = "TensorrtExecutionProvider" in ort.get_available_providers()
-        if _TRT_AVAILABLE:
-            LOGGER.info("TensorRT EP available via ONNX Runtime.")
-        else:
+        has_ep = "TensorrtExecutionProvider" in ort.get_available_providers()
+        if not has_ep:
+            _TRT_AVAILABLE = False
             LOGGER.warning(
                 "TensorRT EP not found in ORT providers. "
                 "TRT backend disabled. Install tensorrt-cu12 or use backend='pytorch'."
             )
+            return _TRT_AVAILABLE
+
+        # Check GPU SM compatibility — recent TRT drops Volta (SM 70)
+        sm = _get_gpu_sm_version(0)
+        if 0 < sm < _TRT_SM_MIN:
+            _TRT_AVAILABLE = False
+            LOGGER.warning(
+                "GPU SM %d (Pascal/older) is not supported by TensorRT "
+                "(requires SM >= %d). TRT backend disabled, using PyTorch.",
+                sm, _TRT_SM_MIN,
+            )
+            return _TRT_AVAILABLE
+
+        _TRT_AVAILABLE = True
+        LOGGER.info("TensorRT EP available via ONNX Runtime (GPU SM %d).", sm)
     except Exception:
         _TRT_AVAILABLE = False
         LOGGER.warning(
@@ -334,7 +361,8 @@ class OnnxTrtSession:
 # Session cache and convenience constructor
 # ---------------------------------------------------------------------------
 
-_ORT_SESSION_CACHE: dict[tuple[str, int, int, int], OnnxTrtSession] = {}
+_ORT_SESSION_CACHE: dict[tuple[str, int, int, int], OnnxTrtSession | None] = {}
+_ORT_FAILED_KEYS: set[tuple[str, int, int, int]] = set()  # Negative cache: don't retry failed sessions
 
 
 def get_ort_session(
@@ -356,6 +384,11 @@ def get_ort_session(
         return None
 
     cache_key = (str(models_dir), device_id, img_size, max_batch)
+
+    # Negative cache: don't retry sessions that already failed (e.g. SM incompatibility)
+    if cache_key in _ORT_FAILED_KEYS:
+        return None
+
     cached = _ORT_SESSION_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -369,6 +402,7 @@ def get_ort_session(
                 "then place it in the models directory alongside the .pth file.",
                 _onnx_path_for(models_dir, img_size).name,
             )
+            _ORT_FAILED_KEYS.add(cache_key)
             return None
 
         LOGGER.info("Found ONNX model: %s", onnx_path)
@@ -388,14 +422,24 @@ def get_ort_session(
 
     except Exception:
         LOGGER.warning("Failed to create ORT/TRT session", exc_info=True)
+        # Cache the failure so we don't retry on every meta-batch
+        _ORT_FAILED_KEYS.add(cache_key)
+        # Also mark TRT as globally unavailable if this looks like an SM compatibility issue
+        global _TRT_AVAILABLE
+        _TRT_AVAILABLE = False
+        LOGGER.warning(
+            "TRT marked as unavailable for this process to prevent repeated retries. "
+            "Using PyTorch backend for all subsequent batches."
+        )
         return None
 
 
 def free_ort_sessions() -> int:
-    """Destroy all cached ORT sessions and free their VRAM."""
+    """Destroy all cached ORT sessions and free their VRAM.
+    Note: does NOT clear _ORT_FAILED_KEYS — failed sessions stay failed for the process lifetime."""
     count = len(_ORT_SESSION_CACHE)
     for key, session in list(_ORT_SESSION_CACHE.items()):
-        if hasattr(session, '_session'):
+        if session is not None and hasattr(session, '_session'):
             del session._session
     _ORT_SESSION_CACHE.clear()
     LOGGER.info("Freed %d ORT session(s).", count)

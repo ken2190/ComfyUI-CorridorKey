@@ -165,7 +165,11 @@ class CorridorKeyEngine:
         return nullcontext()
 
     def _get_ort_session(self, max_batch: int = 4):
-        """Lazily initialize ORT/TRT session. Returns session or None."""
+        """Lazily initialize ORT/TRT session. Returns session or None.
+
+        When backend='tensorrt' but TRT is unavailable (e.g. GPU SM too old),
+        logs a warning and falls back to PyTorch instead of crashing.
+        """
         if self._ort_init_attempted:
             return self._ort_session
         self._ort_init_attempted = True
@@ -174,7 +178,17 @@ class CorridorKeyEngine:
             return None
 
         try:
-            from .onnx_trt_backend import get_ort_session
+            from .onnx_trt_backend import _check_trt_available, get_ort_session
+
+            # Check TRT availability before attempting session creation
+            if not _check_trt_available():
+                if self.backend == "tensorrt":
+                    LOGGER.warning(
+                        "backend='tensorrt' requested but TensorRT is not available for this GPU. "
+                        "Falling back to PyTorch. Set backend='auto' or 'pytorch' to suppress this warning."
+                    )
+                return None
+
             device_id = self.device.index if self.device.index is not None else 0
             self._ort_session = get_ort_session(
                 model=self.model,
@@ -188,10 +202,13 @@ class CorridorKeyEngine:
                     "TRT backend active: provider=%s, device=%s",
                     self._ort_session.active_provider, self.device,
                 )
+            elif self.backend == "tensorrt":
+                LOGGER.warning(
+                    "backend='tensorrt' requested but TRT session creation failed. "
+                    "Falling back to PyTorch."
+                )
         except Exception as e:
             LOGGER.warning("ORT/TRT backend init failed, using PyTorch: %s", e)
-            if self.backend == "tensorrt":
-                raise  # User explicitly requested TRT — don't silently degrade
 
         return self._ort_session
 
