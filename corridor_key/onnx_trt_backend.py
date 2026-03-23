@@ -156,18 +156,31 @@ def find_onnx_model(models_dir: Path, img_size: int) -> Path | None:
 # ORT inference session with TensorRT EP
 # ---------------------------------------------------------------------------
 
+_TRT_AVAILABLE: bool | None = None  # Module-level cache: None = not checked yet
+
+
+def _check_trt_available() -> bool:
+    """Check if TensorRT runtime (libnvinfer.so) is actually loadable.
+    Result is cached globally so we only probe once per process."""
+    global _TRT_AVAILABLE
+    if _TRT_AVAILABLE is not None:
+        return _TRT_AVAILABLE
+    try:
+        import ctypes
+        ctypes.CDLL("libnvinfer.so")
+        _TRT_AVAILABLE = True
+        LOGGER.info("TensorRT runtime found (libnvinfer.so).")
+    except OSError:
+        _TRT_AVAILABLE = False
+        LOGGER.warning(
+            "TensorRT runtime (libnvinfer.so) not found. "
+            "TRT backend disabled for this session. Install tensorrt-cu12 or use backend='pytorch'."
+        )
+    return _TRT_AVAILABLE
+
+
 class OnnxTrtSession:
     """ONNX Runtime inference session with TensorRT or CUDA execution provider."""
-
-    @staticmethod
-    def _check_trt_available() -> bool:
-        """Check if TensorRT runtime (libnvinfer.so) is actually loadable."""
-        try:
-            import ctypes
-            ctypes.CDLL("libnvinfer.so")
-            return True
-        except OSError:
-            return False
 
     def __init__(
         self,
@@ -194,7 +207,7 @@ class OnnxTrtSession:
         providers = []
 
         # Try TensorRT EP first (only if libnvinfer is actually available)
-        trt_available = self._check_trt_available()
+        trt_available = _check_trt_available()
 
         if trt_available:
             trt_opts = {
@@ -334,6 +347,10 @@ def get_ort_session(
     If not found, returns None — run scripts/build_trt_engine.py on the host first.
     TRT engine cache is written to models_dir (must be writable for trt_cache/).
     """
+    # Early exit if TRT is known to be unavailable (avoids repeated log spam)
+    if not _check_trt_available():
+        return None
+
     cache_key = (str(models_dir), device_id, img_size, max_batch)
     cached = _ORT_SESSION_CACHE.get(cache_key)
     if cached is not None:
