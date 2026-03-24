@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """Export ONNX model and (optionally) pre-build TensorRT engine cache.
 
-Run this once on the host. The exported .onnx file is placed alongside the
-.pth model file so it gets mounted into the container read-only, same as
-the checkpoint. The TRT engine cache is GPU-specific and rebuilt inside the
-container on first use.
+Run this once on the host (or inside the container with GPU access).
+The exported .onnx file and TRT engine cache are placed in --output-dir
+so they can be mounted into the container and reused across rebuilds.
 
-Usage (on host, outside container):
-    # Export ONNX to the corridorkey models dir
+Usage:
+    # Export ONNX only (no GPU needed)
     python scripts/build_trt_engine.py --output-dir /home/ubuntu/DATA/ComfyUI/models/corridorkey
 
-    # Export + pre-build TRT engines (run inside container or with GPU access)
-    python scripts/build_trt_engine.py --output-dir /path/to/models/corridorkey --gpu 0 --gpu 1
+    # Export ONNX + pre-build TRT engines for both GPUs
+    python scripts/build_trt_engine.py --output-dir /home/ubuntu/DATA/ComfyUI/models/corridorkey --gpu 0 --gpu 1
+
+    # Inside the running container (engines go to the persistent mount):
+    docker exec comfyui python /app/custom_nodes/ComfyUI-CorridorKey/scripts/build_trt_engine.py \
+        --output-dir /trt-cache --gpu 0 --gpu 1
+
+The TRT engine cache is GPU-architecture-specific (e.g. SM 70 for V100).
+It persists across container rebuilds as long as the same GPU hardware is used.
+Set CORRIDORKEY_TRT_CACHE_DIR in docker-compose to point to the persistent mount.
 """
 from __future__ import annotations
 

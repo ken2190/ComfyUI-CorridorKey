@@ -7,8 +7,9 @@ file (e.g. /home/ubuntu/DATA/ComfyUI/models/corridorkey/). It is then
 mounted read-only into the container just like the .pth, and symlinked
 into the custom node's models/ dir by entrypoint.sh.
 
-The TRT engine cache (GPU-specific, rebuilt per container) goes into the
-custom node's writable models/ dir.
+The TRT engine cache (GPU-specific) goes into the custom node's writable
+models/ dir by default, or into CORRIDORKEY_TRT_CACHE_DIR if set. Mount
+a persistent host directory there to avoid rebuilding after container restarts.
 """
 from __future__ import annotations
 
@@ -371,6 +372,21 @@ _ORT_SESSION_CACHE: dict[tuple[str, int, int, int], OnnxTrtSession | None] = {}
 _ORT_FAILED_KEYS: set[tuple[str, int, int, int]] = set()  # Negative cache: don't retry failed sessions
 
 
+def _resolve_trt_cache_dir(fallback: Path) -> Path:
+    """Return the TRT engine cache directory.
+
+    Priority:
+    1. CORRIDORKEY_TRT_CACHE_DIR env var (set this to a persistent mount)
+    2. fallback (models_dir inside the custom node — lost on rebuild)
+    """
+    env_dir = os.environ.get("CORRIDORKEY_TRT_CACHE_DIR")
+    if env_dir:
+        p = Path(env_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return fallback
+
+
 def get_ort_session(
     model: nn.Module,
     models_dir: Path,
@@ -383,13 +399,17 @@ def get_ort_session(
 
     Looks for a pre-exported ONNX model in models_dir (read-only, alongside .pth).
     If not found, returns None — run scripts/build_trt_engine.py on the host first.
-    TRT engine cache is written to models_dir (must be writable for trt_cache/).
+
+    TRT engine cache location (in priority order):
+    1. CORRIDORKEY_TRT_CACHE_DIR env var — mount a persistent host dir here
+    2. models_dir (writable custom node dir — lost on container rebuild)
     """
     # Early exit if TRT is known to be unavailable (avoids repeated log spam)
     if not _check_trt_available():
         return None
 
-    cache_key = (str(models_dir), device_id, img_size, max_batch)
+    trt_cache_dir = _resolve_trt_cache_dir(fallback=models_dir)
+    cache_key = (str(trt_cache_dir), device_id, img_size, max_batch)
 
     # Negative cache: don't retry sessions that already failed (e.g. SM incompatibility)
     if cache_key in _ORT_FAILED_KEYS:
@@ -412,11 +432,12 @@ def get_ort_session(
             return None
 
         LOGGER.info("Found ONNX model: %s", onnx_path)
+        LOGGER.info("TRT cache dir: %s", trt_cache_dir)
 
-        # TRT engine cache: writable dir inside the custom node's models/
+        # TRT engine cache: persistent mount (env var) or custom node models dir
         session = OnnxTrtSession(
             onnx_path=onnx_path,
-            trt_cache_dir=models_dir,
+            trt_cache_dir=trt_cache_dir,
             device_id=device_id,
             img_size=img_size,
             max_batch=max_batch,
