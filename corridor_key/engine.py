@@ -119,12 +119,20 @@ class CorridorKeyEngine:
         self.std_t = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1).to(self.device)
 
         _configure_torch_for_inference(self.device.type)
-        self.model = self._load_model()
+        # PyTorch model — lazily loaded only when needed (TRT path skips it entirely)
+        self.model: GreenFormer | None = None
         self._compiled = False
 
         # ORT/TRT session — lazily initialized on first inference
         self._ort_session = None
         self._ort_init_attempted = False
+
+    def _ensure_model_loaded(self) -> GreenFormer:
+        """Load PyTorch model on demand. Skipped entirely when TRT handles inference."""
+        if self.model is not None:
+            return self.model
+        self.model = self._load_model()
+        return self.model
 
     def _load_model(self) -> GreenFormer:
         model = GreenFormer(
@@ -191,7 +199,7 @@ class CorridorKeyEngine:
 
             device_id = self.device.index if self.device.index is not None else 0
             self._ort_session = get_ort_session(
-                model=self.model,
+                model=None,  # model only needed for ONNX export; pre-exported via build script
                 models_dir=MODELS_DIR,
                 device_id=device_id,
                 img_size=self.img_size,
@@ -264,17 +272,20 @@ class CorridorKeyEngine:
             alpha_raw, fg_raw = ort_session(input_tensor)
         else:
             # PyTorch path (fallback or refiner_scale != 1.0)
+            # Lazy-load model only when actually needed
+            model = self._ensure_model_loaded()
+
             if self.channels_last:
                 input_tensor = input_tensor.to(memory_format=torch.channels_last)
 
             hook_handle = None
-            if refiner_scale != 1.0 and self.model.refiner is not None:
+            if refiner_scale != 1.0 and model.refiner is not None:
                 def scale_hook(_module, _inputs, output):
                     return output * refiner_scale
-                hook_handle = self.model.refiner.register_forward_hook(scale_hook)
+                hook_handle = model.refiner.register_forward_hook(scale_hook)
 
             with self._autocast_context():
-                output = self.model(input_tensor)
+                output = model(input_tensor)
 
             if hook_handle is not None:
                 hook_handle.remove()
@@ -501,15 +512,17 @@ class CorridorKeyEngine:
         if self.channels_last:
             input_tensor = input_tensor.to(memory_format=torch.channels_last)
 
+        model = self._ensure_model_loaded()
+
         hook_handle = None
-        if refiner_scale != 1.0 and self.model.refiner is not None:
+        if refiner_scale != 1.0 and model.refiner is not None:
             def scale_hook(_module, _inputs, output):
                 return output * refiner_scale
 
-            hook_handle = self.model.refiner.register_forward_hook(scale_hook)
+            hook_handle = model.refiner.register_forward_hook(scale_hook)
 
         with self._autocast_context():
-            output = self.model(input_tensor)
+            output = model(input_tensor)
 
         if hook_handle is not None:
             hook_handle.remove()
@@ -576,16 +589,25 @@ def get_cached_engine(
     return engine
 
 
-def free_all_engines() -> int:
+def free_all_engines(keep_ort_sessions: bool = True) -> int:
     """Destroy all cached engines, release GPU VRAM, and clear CUDA cache.
-    Returns the number of engines freed."""
+
+    Args:
+        keep_ort_sessions: If True (default), keep ORT/TRT sessions alive in
+            the global cache so they can be reused without the 3-4s reload
+            penalty per GPU. TRT sessions are lightweight (~50MB) compared
+            to the PyTorch model (~2-4GB). Set False to free everything.
+
+    Returns the number of engines freed.
+    """
     count = len(_ENGINE_CACHE)
     for key, engine in list(_ENGINE_CACHE.items()):
-        # Delete ORT session if present
-        if hasattr(engine, '_ort_session') and engine._ort_session is not None:
-            del engine._ort_session
-            engine._ort_session = None
-        # Delete model
+        if not keep_ort_sessions:
+            # Delete ORT session if present
+            if hasattr(engine, '_ort_session') and engine._ort_session is not None:
+                del engine._ort_session
+                engine._ort_session = None
+        # Delete model (PyTorch — the heavy part, ~2-4GB VRAM)
         if hasattr(engine, 'model') and engine.model is not None:
             del engine.model
             engine.model = None
@@ -596,12 +618,13 @@ def free_all_engines() -> int:
             del engine.std_t
     _ENGINE_CACHE.clear()
 
-    # Also clear the separate ORT session cache in onnx_trt_backend
-    try:
-        from .onnx_trt_backend import free_ort_sessions
-        free_ort_sessions()
-    except Exception:
-        pass
+    if not keep_ort_sessions:
+        # Also clear the separate ORT session cache in onnx_trt_backend
+        try:
+            from .onnx_trt_backend import free_ort_sessions
+            free_ort_sessions()
+        except Exception:
+            pass
 
     import gc
     gc.collect()
@@ -610,7 +633,7 @@ def free_all_engines() -> int:
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    LOGGER.info("Freed %d CorridorKey engine(s) and cleared CUDA cache.", count)
+    LOGGER.info("Freed %d CorridorKey engine(s) and cleared CUDA cache (kept ORT sessions: %s).", count, keep_ort_sessions)
     return count
 
 

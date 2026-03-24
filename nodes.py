@@ -255,8 +255,10 @@ class CorridorKey:
         )
 
         if unload_model == "On":
-            freed = free_all_engines()
-            print(f"[CorridorKey] Unloaded {freed} engine(s), VRAM freed.")
+            # Keep ORT/TRT sessions cached — they're lightweight (~50MB) and
+            # take 3-4s per GPU to recreate. Only free PyTorch model (~2-4GB).
+            freed = free_all_engines(keep_ort_sessions=True)
+            print(f"[CorridorKey] Unloaded {freed} engine(s), VRAM freed (TRT sessions kept).")
 
         return result
 
@@ -298,6 +300,7 @@ class CorridorKey_FreeVRAM:
     OUTPUT_NODE = True
 
     def run(self, images):
-        freed = free_all_engines()
-        print(f"[CorridorKey_FreeVRAM] Freed {freed} engine(s), CUDA cache cleared.")
+        # Full cleanup: free everything including ORT/TRT sessions
+        freed = free_all_engines(keep_ort_sessions=False)
+        print(f"[CorridorKey_FreeVRAM] Freed {freed} engine(s) + ORT sessions, CUDA cache cleared.")
         return (images,)
