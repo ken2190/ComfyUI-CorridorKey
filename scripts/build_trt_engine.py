@@ -2,19 +2,20 @@
 """Export ONNX model and (optionally) pre-build TensorRT engine cache.
 
 Run this once on the host (or inside the container with GPU access).
-The exported .onnx file and TRT engine cache are placed in --output-dir
-so they can be mounted into the container and reused across rebuilds.
+The .pth model is loaded from --models-dir, ONNX is exported there too.
+TRT engine cache goes to --trt-cache-dir (defaults to --models-dir).
 
 Usage:
     # Export ONNX only (no GPU needed)
-    python scripts/build_trt_engine.py --output-dir /home/ubuntu/DATA/ComfyUI/models/corridorkey
+    python scripts/build_trt_engine.py \
+        --models-dir /app/custom_nodes/ComfyUI-CorridorKey/models
 
-    # Export ONNX + pre-build TRT engines for both GPUs
-    python scripts/build_trt_engine.py --output-dir /home/ubuntu/DATA/ComfyUI/models/corridorkey --gpu 0 --gpu 1
-
-    # Inside the running container (engines go to the persistent mount):
+    # Export ONNX + pre-build TRT engines into persistent mount
     docker exec comfyui python /app/custom_nodes/ComfyUI-CorridorKey/scripts/build_trt_engine.py \
-        --output-dir /trt-cache --gpu 0 --gpu 1
+        --models-dir /app/custom_nodes/ComfyUI-CorridorKey/models \
+        --trt-cache-dir /trt-cache \
+        --img-size 2048 --max-batch 2 \
+        --gpu 0 --gpu 1
 
 The TRT engine cache is GPU-architecture-specific (e.g. SM 70 for V100).
 It persists across container rebuilds as long as the same GPU hardware is used.
@@ -40,8 +41,14 @@ LOGGER = logging.getLogger("build_trt_engine")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export ONNX and pre-build TensorRT engine for CorridorKey")
-    parser.add_argument("--output-dir", type=str, required=True,
-                        help="Directory to write ONNX file (same dir as .pth model)")
+    parser.add_argument("--models-dir", type=str, default=None,
+                        help="Directory containing the .pth model file (ONNX will be written here too)")
+    parser.add_argument("--trt-cache-dir", type=str, default=None,
+                        help="Directory for TRT engine cache (default: same as --models-dir). "
+                             "Use a persistent mount like /trt-cache to survive container rebuilds.")
+    # Keep --output-dir as hidden alias for backwards compatibility
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--img-size", type=int, default=2048, choices=[768, 1024, 1536, 2048])
     parser.add_argument("--max-batch", type=int, default=4)
     parser.add_argument("--gpu", type=int, action="append", default=None,
@@ -50,23 +57,32 @@ def main() -> None:
     parser.add_argument("--no-fp16", action="store_true", help="Disable FP16 (use FP32)")
     args = parser.parse_args()
 
+    # Handle --output-dir as alias for --models-dir (backwards compat)
+    if args.models_dir is None and args.output_dir is not None:
+        args.models_dir = args.output_dir
+    if args.models_dir is None:
+        parser.error("--models-dir is required")
+
     import torch
     from corridor_key.model_transformer import GreenFormer
     from corridor_key.onnx_trt_backend import export_onnx, OnnxTrtSession
 
-    output_dir = Path(args.output_dir)
+    models_dir = Path(args.models_dir)
+    trt_cache_dir = Path(args.trt_cache_dir) if args.trt_cache_dir else models_dir
     fp16 = not args.no_fp16
     gpu_ids = args.gpu or []
 
-    # Find checkpoint in output_dir (same dir as where we write ONNX)
-    pth_files = sorted(output_dir.glob("*.pth"))
+    # Find checkpoint in models_dir
+    pth_files = sorted(models_dir.glob("*.pth"))
     if not pth_files:
-        LOGGER.error("No .pth model found in %s", output_dir)
+        LOGGER.error("No .pth model found in %s", models_dir)
         sys.exit(1)
     checkpoint_path = pth_files[0]
 
     LOGGER.info("Config: img_size=%d, max_batch=%d, fp16=%s, gpus=%s",
                 args.img_size, args.max_batch, fp16, gpu_ids)
+    LOGGER.info("Models dir: %s", models_dir)
+    LOGGER.info("TRT cache dir: %s", trt_cache_dir)
     LOGGER.info("Loading model from %s...", checkpoint_path)
 
     model = GreenFormer(
@@ -79,10 +95,10 @@ def main() -> None:
     state_dict = checkpoint.get("state_dict", checkpoint)
     model.load_checkpoint(state_dict)
 
-    # Step 1: Export ONNX to output_dir (alongside .pth)
+    # Step 1: Export ONNX to models_dir (alongside .pth)
     onnx_path = export_onnx(
         model=model,
-        output_dir=output_dir,
+        output_dir=models_dir,
         img_size=args.img_size,
         max_batch=args.max_batch,
         device=torch.device("cpu"),
@@ -90,12 +106,13 @@ def main() -> None:
     LOGGER.info("ONNX model: %s", onnx_path)
 
     # Step 2: Build TRT engines for each GPU (optional)
+    trt_cache_dir.mkdir(parents=True, exist_ok=True)
     for gpu_id in gpu_ids:
         LOGGER.info("Building TRT engine for GPU %d (this may take 5-15 minutes)...", gpu_id)
         t0 = time.monotonic()
         session = OnnxTrtSession(
             onnx_path=onnx_path,
-            trt_cache_dir=output_dir,
+            trt_cache_dir=trt_cache_dir,
             device_id=gpu_id,
             img_size=args.img_size,
             max_batch=args.max_batch,
@@ -107,7 +124,7 @@ def main() -> None:
     if not gpu_ids:
         LOGGER.info("ONNX export complete. TRT engine will be built on first use inside the container.")
     else:
-        LOGGER.info("Done. ONNX + TRT engines ready.")
+        LOGGER.info("Done. ONNX + TRT engines ready in %s", trt_cache_dir)
 
 
 if __name__ == "__main__":
