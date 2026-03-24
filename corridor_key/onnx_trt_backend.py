@@ -247,8 +247,8 @@ class OnnxTrtSession:
                 "trt_fp16_enable": fp16,
                 "trt_engine_cache_enable": True,
                 "trt_engine_cache_path": str(cache_dir),
-                "trt_max_workspace_size": str(8 * 1024 ** 3),  # 8 GB
-                "trt_builder_optimization_level": "5",
+                "trt_max_workspace_size": str(2 * 1024 ** 3),  # 2 GB (V100 32GB needs headroom for model tensors)
+                "trt_builder_optimization_level": "3",  # 3 = good balance; 5 tries more tactics that may OOM on 32GB GPUs
                 "trt_profile_min_shapes": f"input:1x4x{img_size}x{img_size}",
                 "trt_profile_max_shapes": shape_str,
                 "trt_profile_opt_shapes": shape_str,
