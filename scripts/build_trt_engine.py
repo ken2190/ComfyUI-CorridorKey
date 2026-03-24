@@ -64,46 +64,53 @@ def main() -> None:
         parser.error("--models-dir is required")
 
     import torch
-    from corridor_key.model_transformer import GreenFormer
-    from corridor_key.onnx_trt_backend import export_onnx, OnnxTrtSession
+    from corridor_key.onnx_trt_backend import OnnxTrtSession, find_onnx_model
 
     models_dir = Path(args.models_dir)
     trt_cache_dir = Path(args.trt_cache_dir) if args.trt_cache_dir else models_dir
     fp16 = not args.no_fp16
     gpu_ids = args.gpu or []
 
-    # Find checkpoint in models_dir
-    pth_files = sorted(models_dir.glob("*.pth"))
-    if not pth_files:
-        LOGGER.error("No .pth model found in %s", models_dir)
-        sys.exit(1)
-    checkpoint_path = pth_files[0]
-
     LOGGER.info("Config: img_size=%d, max_batch=%d, fp16=%s, gpus=%s",
                 args.img_size, args.max_batch, fp16, gpu_ids)
     LOGGER.info("Models dir: %s", models_dir)
     LOGGER.info("TRT cache dir: %s", trt_cache_dir)
-    LOGGER.info("Loading model from %s...", checkpoint_path)
 
-    model = GreenFormer(
-        encoder_name="hiera_base_plus_224.mae_in1k_ft_in1k",
-        img_size=args.img_size,
-        use_refiner=True,
-    )
-    model.eval()
-    checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
-    state_dict = checkpoint.get("state_dict", checkpoint)
-    model.load_checkpoint(state_dict)
+    # Step 1: Check for existing ONNX model, export only if missing
+    onnx_path = find_onnx_model(models_dir, args.img_size)
+    if onnx_path is not None:
+        LOGGER.info("ONNX model already exists, skipping export: %s", onnx_path)
+    else:
+        LOGGER.info("ONNX model not found, exporting...")
+        from corridor_key.model_transformer import GreenFormer
+        from corridor_key.onnx_trt_backend import export_onnx
 
-    # Step 1: Export ONNX to models_dir (alongside .pth)
-    onnx_path = export_onnx(
-        model=model,
-        output_dir=models_dir,
-        img_size=args.img_size,
-        max_batch=args.max_batch,
-        device=torch.device("cpu"),
-    )
-    LOGGER.info("ONNX model: %s", onnx_path)
+        # Find checkpoint in models_dir
+        pth_files = sorted(models_dir.glob("*.pth"))
+        if not pth_files:
+            LOGGER.error("No .pth model found in %s", models_dir)
+            sys.exit(1)
+        checkpoint_path = pth_files[0]
+        LOGGER.info("Loading model from %s...", checkpoint_path)
+
+        model = GreenFormer(
+            encoder_name="hiera_base_plus_224.mae_in1k_ft_in1k",
+            img_size=args.img_size,
+            use_refiner=True,
+        )
+        model.eval()
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        model.load_checkpoint(state_dict)
+
+        onnx_path = export_onnx(
+            model=model,
+            output_dir=models_dir,
+            img_size=args.img_size,
+            max_batch=args.max_batch,
+            device=torch.device("cpu"),
+        )
+        LOGGER.info("ONNX model exported: %s", onnx_path)
 
     # Step 2: Build TRT engines for each GPU (optional)
     trt_cache_dir.mkdir(parents=True, exist_ok=True)
