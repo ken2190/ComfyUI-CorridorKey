@@ -293,7 +293,13 @@ class OnnxTrtSession:
         elif "CUDAExecutionProvider" in active:
             self.active_provider = "CUDA"
         else:
-            self.active_provider = active[0] if active else "CPU"
+            # CPU-only: IO binding with GPU tensors will crash. Reject this session.
+            del self._session
+            raise RuntimeError(
+                "ORT session has no GPU provider (got %s). "
+                "This usually means cuDNN 9 is missing (libcudnn_adv.so.9). "
+                "Install nvidia-cudnn-cu12 or use backend='pytorch'." % active
+            )
 
         LOGGER.info(
             "ORT session ready: provider=%s, device=%d (%.1fs)",
