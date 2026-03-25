@@ -611,12 +611,14 @@ def free_all_engines(keep_ort_sessions: bool = True) -> int:
         if hasattr(engine, 'model') and engine.model is not None:
             del engine.model
             engine.model = None
-        # Delete GPU tensors
-        if hasattr(engine, 'mean_t'):
-            del engine.mean_t
-        if hasattr(engine, 'std_t'):
-            del engine.std_t
-    _ENGINE_CACHE.clear()
+        # Note: keep mean_t/std_t — they're tiny (24 bytes each) and
+        # needed for inference; not recreated by _ensure_model_loaded().
+    if not keep_ort_sessions:
+        _ENGINE_CACHE.clear()
+    # When keep_ort_sessions=True, keep engine shells in cache so next
+    # batch reuses them (lazy model reload via _ensure_model_loaded,
+    # ORT/TRT sessions already alive). This avoids the full engine
+    # recreation penalty for both PyTorch and TensorRT backends.
 
     if not keep_ort_sessions:
         # Also clear the separate ORT session cache in onnx_trt_backend
