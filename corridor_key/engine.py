@@ -130,6 +130,17 @@ class CorridorKeyEngine:
     def _ensure_model_loaded(self) -> GreenFormer:
         """Load PyTorch model on demand. Skipped entirely when TRT handles inference."""
         if self.model is not None:
+            # Model exists — check if it was offloaded to CPU between batches
+            try:
+                param_device = next(self.model.parameters()).device
+            except StopIteration:
+                param_device = self.device
+            if param_device != self.device:
+                LOGGER.info("Moving model from %s back to %s (~0.5s)", param_device, self.device)
+                self.model = self.model.to(self.device)
+                if self.channels_last:
+                    self.model = self.model.to(memory_format=torch.channels_last)
+                self._compiled = False
             return self.model
         self.model = self._load_model()
         return self.model
@@ -607,18 +618,26 @@ def free_all_engines(keep_ort_sessions: bool = True) -> int:
             if hasattr(engine, '_ort_session') and engine._ort_session is not None:
                 del engine._ort_session
                 engine._ort_session = None
-        # Delete model (PyTorch — the heavy part, ~2-4GB VRAM)
+        # Free model GPU VRAM (PyTorch — the heavy part, ~2-4GB)
         if hasattr(engine, 'model') and engine.model is not None:
-            del engine.model
-            engine.model = None
+            if keep_ort_sessions:
+                # Offload to CPU RAM (~0.5s to restore vs ~3-5s from disk)
+                try:
+                    engine.model = engine.model.cpu()
+                    engine._compiled = False
+                except Exception:
+                    del engine.model
+                    engine.model = None
+            else:
+                del engine.model
+                engine.model = None
         # Note: keep mean_t/std_t — they're tiny (24 bytes each) and
         # needed for inference; not recreated by _ensure_model_loaded().
     if not keep_ort_sessions:
         _ENGINE_CACHE.clear()
     # When keep_ort_sessions=True, keep engine shells in cache so next
-    # batch reuses them (lazy model reload via _ensure_model_loaded,
-    # ORT/TRT sessions already alive). This avoids the full engine
-    # recreation penalty for both PyTorch and TensorRT backends.
+    # batch reuses them: PyTorch model offloaded to CPU (fast restore),
+    # ORT/TRT sessions stay on GPU. Avoids full reload for both backends.
 
     if not keep_ort_sessions:
         # Also clear the separate ORT session cache in onnx_trt_backend
